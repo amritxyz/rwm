@@ -18,10 +18,32 @@
 #include "river-window-management-v1-client-protocol.h"
 #include "river-xkb-bindings-v1-client-protocol.h"
 
+enum LayoutMode {
+	LAYOUT_MASTER_STACK,
+	LAYOUT_FLOATING,
+};
+
 struct Output {
 	struct river_output_v1 *obj;
 	bool removed;
+
+	enum LayoutMode layout_mode;
+	unsigned int master_count;
+	float master_ratio;
+	int gap_size;
+	int32_t x, y, width, height;
+
 	struct wl_list link; // WindowManager.outputs
+};
+
+static struct {
+	unsigned int default_master_count;
+	float default_master_ratio;
+	int default_gap_size;
+} layout_config = {
+	.default_master_count = 1,
+	.default_master_ratio = 0.6f,
+	.default_gap_size = 4
 };
 
 struct Window {
@@ -51,6 +73,12 @@ enum Action {
 	ACTION_MOVE,
 	ACTION_RESIZE,
 	ACTION_EXIT,
+
+	ACTION_LAYOUT_TOGGLE,
+	ACTION_MASTER_INC,
+	ACTION_MASTER_DEC,
+	ACTION_MASTER_COUNT_INC,
+	ACTION_MASTER_COUNT_DEC,
 };
 
 struct XkbBinding {
@@ -115,10 +143,20 @@ static void output_handle_removed(void *data, struct river_output_v1 *obj) {
 	output->removed = true;
 }
 
-// Ignored events
+// Ignored event
 static void output_handle_wl_output(void *data, struct river_output_v1 *obj, uint32_t name) {}
-static void output_handle_position(void *data, struct river_output_v1 *obj, int32_t x, int32_t y) {}
-static void output_handle_dimensions(void *data, struct river_output_v1 *obj, int32_t width, int32_t height) {}
+
+static void output_handle_position(void *data, struct river_output_v1 *obj, int32_t x, int32_t y) {
+    struct Output *output = data;
+    output->x = x;
+    output->y = y;
+}
+
+static void output_handle_dimensions(void *data, struct river_output_v1 *obj, int32_t width, int32_t height) {
+    struct Output *output = data;
+    output->width = width;
+    output->height = height;
+}
 
 const struct river_output_v1_listener river_output_listener = {
 	.removed = output_handle_removed,
@@ -198,6 +236,10 @@ const struct river_window_v1_listener river_window_listener = {
 	.identifier = window_handle_identifier,
 };
 
+static int collect_windows(struct Window **out, int max);
+static void layout_master_stack(struct Output *output);
+static void layout_all(void);
+
 static void window_maybe_destroy(struct Window *window) {
 	if (!window->closed) {
 		return;
@@ -232,7 +274,7 @@ static void seat_pointer_resize(struct Seat *seat, struct Window *window, uint32
 static void window_manage(struct Window *window) {
 	if (window->new) {
 		window->new = false;
-		window_set_position(window, 0, 0);
+		// window_set_position(window, 0, 0);
 		river_window_v1_propose_dimensions(window->obj, 0, 0);
 	}
 	if (window->pointer_move_requested != NULL) {
@@ -461,6 +503,44 @@ static void seat_action(struct Seat *seat, enum Action action) {
 	case ACTION_EXIT:
 		river_window_manager_v1_exit_session(window_manager_v1);
 		break;
+	case ACTION_LAYOUT_TOGGLE: {
+			if (!wl_list_empty(&wm.outputs)) {
+				struct Output *output = wl_container_of(&wm.outputs, output, link);
+				output->layout_mode = (output->layout_mode == LAYOUT_MASTER_STACK)
+					? LAYOUT_FLOATING : LAYOUT_MASTER_STACK;
+			}
+			break;
+		}
+	case ACTION_MASTER_INC: {
+			if (!wl_list_empty(&wm.outputs)) {
+				struct Output *output = wl_container_of(&wm.outputs, output, link);
+				output->master_ratio += 0.05f;
+				if (output->master_ratio > 0.9f) output->master_ratio = 0.9f;
+			}
+			break;
+		}
+	case ACTION_MASTER_DEC: {
+			if (!wl_list_empty(&wm.outputs)) {
+				struct Output *output = wl_container_of(&wm.outputs, output, link);
+				output->master_ratio -= 0.05f;
+				if (output->master_ratio < 0.1f) output->master_ratio = 0.1f;
+			}
+			break;
+		}
+	case ACTION_MASTER_COUNT_INC: {
+				if (!wl_list_empty(&wm.outputs)) {
+					struct Output *output = wl_container_of(&wm.outputs, output, link);
+					output->master_count++;
+				}
+			break;
+		}
+	case ACTION_MASTER_COUNT_DEC: {
+			if (!wl_list_empty(&wm.outputs)) {
+				struct Output *output = wl_container_of(&wm.outputs, output, link);
+				if (output->master_count > 1) output->master_count--;
+			}
+			break;
+		}
 	}
 }
 
@@ -474,6 +554,12 @@ static void seat_manage(struct Seat *seat) {
 		xkb_binding_create(seat, super, XKB_KEY_Escape, ACTION_EXIT);
 		pointer_binding_create(seat, super, BTN_LEFT, ACTION_MOVE);
 		pointer_binding_create(seat, super, BTN_RIGHT, ACTION_RESIZE);
+
+		xkb_binding_create(seat, super, XKB_KEY_space, ACTION_LAYOUT_TOGGLE);
+		xkb_binding_create(seat, super, XKB_KEY_l, ACTION_MASTER_INC);
+		xkb_binding_create(seat, super, XKB_KEY_h, ACTION_MASTER_DEC);
+		xkb_binding_create(seat, super | RIVER_SEAT_V1_MODIFIERS_SHIFT, XKB_KEY_l, ACTION_MASTER_COUNT_INC);
+		xkb_binding_create(seat, super | RIVER_SEAT_V1_MODIFIERS_SHIFT, XKB_KEY_h, ACTION_MASTER_COUNT_DEC);
 	}
 
 	// If no window was interacted with in the current manage sequence,
@@ -571,6 +657,8 @@ static void wm_handle_manage_start(void *data, struct river_window_manager_v1 *o
 		seat_maybe_destroy(seat);
 	}
 
+	layout_all();
+
 	// Carry out window management policy
 	wl_list_for_each(window, &wm.windows, link) {
 		window_manage(window);
@@ -607,6 +695,18 @@ static void wm_handle_output(
 		void *data, struct river_window_manager_v1 *obj, struct river_output_v1 *river_output) {
 	struct Output *output = calloc(1, sizeof(struct Output));
 	output->obj = river_output;
+
+	output->layout_mode = LAYOUT_MASTER_STACK;
+	output->master_count = layout_config.default_master_count;
+	output->master_ratio = layout_config.default_master_ratio;
+	output->gap_size = layout_config.default_gap_size;
+	output->x = 0; output->y = 0;  /* Will be updated by position event */
+
+	/*
+	 * TODO Auto detect or configurable
+	 * defaults for my PC at this time.
+	 */
+	output->width = 1920; output->height = 1200;
 
 	river_output_v1_add_listener(output->obj, &river_output_listener, output);
 
@@ -665,6 +765,109 @@ static const struct wl_registry_listener registry_listener = {
 	.global = handle_global,
 	.global_remove = handle_global_remove,
 };
+
+/* Helper: collect non-closed windows into an array for layout */
+static int collect_windows(struct Window **out, int max) {
+	int count = 0;
+	struct Window *window;
+	wl_list_for_each(window, &wm.windows, link) {
+		if (window->closed) continue;
+		if (count >= max) break;
+		out[count++] = window;
+	}
+	return count;
+}
+
+/* Master-stack tiling algorithm */
+static void layout_master_stack(struct Output *output) {
+	struct Window *windows[64];
+	int count = collect_windows(windows, 64);
+	if (count == 0) return;
+
+	int gap = output->gap_size;
+
+	/* If there is one client then occupy full screen */
+	if (count == 1) {
+		struct Window *win = windows[0];
+		int x = output->x + gap;
+		int y = output->y + gap;
+		int w = output->width - gap * 2;
+		int h = output->height - gap * 2;
+
+		river_node_v1_set_position(win->node, x, y);
+		river_window_v1_propose_dimensions(win->obj, w > 50 ? w : 50, h > 50 ? h : 50);
+		win->x = x; win->y = y;
+		win->width = w; win->height = h;
+		return;
+	}
+
+	int master_count = output->master_count;
+	if (master_count < 1) master_count = 1;
+	if (master_count > count) master_count = count;
+
+	float ratio = output->master_ratio;
+	if (ratio < 0.1f) ratio = 0.1f;
+	if (ratio > 0.9f) ratio = 0.9f;
+
+	/* Calculate areas */
+	int usable_w = output->width - gap * 2;
+	int usable_h = output->height - gap * 2;
+	int master_w = (int)(usable_w * ratio) - gap;
+	int stack_w = usable_w - master_w - gap;
+
+	int base_x = output->x + gap;
+	int base_y = output->y + gap;
+
+	/* Layout master windows [left side, vertical stack] */
+	for (int i = 0; i < master_count; i++) {
+		struct Window *win = windows[i];
+		int win_h = (usable_h / master_count) - gap;
+		int x = base_x;
+		int y = base_y + i * (win_h + gap);
+
+		river_node_v1_set_position(win->node, x, y);
+		river_window_v1_propose_dimensions(win->obj,
+				master_w > 50 ? master_w : 50,
+				win_h > 50 ? win_h : 50);
+
+		// Cache for interactive ops
+		win->x = x; win->y = y;
+		win->width = master_w; win->height = win_h;
+	}
+
+	/* Layout stack windows [right side, vertical stack] */
+	int stack_count = count - master_count;
+	for (int i = 0; i < stack_count; i++) {
+		struct Window *win = windows[master_count + i];
+		int win_h = (usable_h / stack_count) - gap;
+		int x = base_x + master_w + gap;
+		int y = base_y + i * (win_h + gap);
+
+		river_node_v1_set_position(win->node, x, y);
+		river_window_v1_propose_dimensions(win->obj,
+				stack_w > 50 ? stack_w : 50,
+				win_h > 50 ? win_h : 50);
+
+		win->x = x; win->y = y;
+		win->width = stack_w; win->height = win_h;
+	}
+}
+
+/* Main layout dispatcher - this tiles all windows */
+static void layout_all(void) {
+	struct Output *output;
+	wl_list_for_each(output, &wm.outputs, link) {
+		if (output->removed) continue;
+
+		switch (output->layout_mode) {
+			case LAYOUT_MASTER_STACK:
+				layout_master_stack(output);
+				break;
+			case LAYOUT_FLOATING:
+				break; /* INFO Skip positioning - let windows floatS */
+		}
+	}
+}
 
 int main(void) {
 	struct wl_display *display = wl_display_connect(NULL);
