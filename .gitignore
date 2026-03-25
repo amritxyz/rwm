@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: © 2026 Isaac Freund
+# SPDX-License-Identifier: 0BSD
+
+*.o
+rwm
+river-*.h
+river-*.c
