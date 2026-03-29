@@ -12,6 +12,7 @@
 #include <wayland-client-protocol.h>
 
 #include <linux/input-event-codes.h>
+#include <wayland-util.h>
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
@@ -551,7 +552,7 @@ static void seat_manage(struct Seat *seat) {
 		xkb_binding_create(seat, super, XKB_KEY_Return, ACTION_SPAWN_TERMINAL);
 		xkb_binding_create(seat, super, XKB_KEY_q, ACTION_CLOSE);
 		xkb_binding_create(seat, super, XKB_KEY_n, ACTION_FOCUS_NEXT);
-		xkb_binding_create(seat, super, XKB_KEY_Escape, ACTION_EXIT);
+		xkb_binding_create(seat, super | RIVER_SEAT_V1_MODIFIERS_SHIFT , XKB_KEY_q, ACTION_EXIT);
 		pointer_binding_create(seat, super, BTN_LEFT, ACTION_MOVE);
 		pointer_binding_create(seat, super, BTN_RIGHT, ACTION_RESIZE);
 
@@ -674,6 +675,15 @@ static void wm_handle_render_start(void *data, struct river_window_manager_v1 *o
 	struct Seat *seat;
 	wl_list_for_each(seat, &wm.seats, link) {
 		seat_render(seat);
+	}
+
+	struct Output *output;
+	wl_list_for_each(output, &wm.outputs, link) {
+		if (!output->removed) {
+			river_output_v1_set_presentation_mode(
+					output->obj,
+					RIVER_OUTPUT_V1_PRESENTATION_MODE_ASYNC);
+		};
 	}
 
 	river_window_manager_v1_render_finish(window_manager_v1);
