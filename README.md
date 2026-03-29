@@ -11,8 +11,7 @@ Tiny river window manager implemented in C.
 
 The following system dependencies are required:
 
-- meson
-- ninja
+- gnu make
 - wayland
 - xkbcommon
 
