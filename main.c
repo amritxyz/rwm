@@ -285,6 +285,9 @@ static void window_manage(struct Window *window) {
 			river_window_v1_propose_dimensions(window->obj, 0, 0);
 		}
 	}
+
+	river_window_v1_use_ssd(window->obj); /* Use ssd by defualt */
+
 	if (window->pointer_move_requested != NULL) {
 		seat_pointer_move(window->pointer_move_requested, window);
 		window->pointer_move_requested = NULL;
