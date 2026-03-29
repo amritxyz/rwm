@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2026 Isaac Freund
+// SPDX-FileCopyrightText: © 2026 Amritxyz
 // SPDX-License-Identifier: 0BSD
 
 #include <stdbool.h>
