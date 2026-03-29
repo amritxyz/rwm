@@ -7,11 +7,6 @@ SPDX-License-Identifier: 0BSD
 
 Tiny river window manager implemented in C.
 
-## Acknowledgements
-
-Inspired by [tinyrwm](https://codeberg.org/river/tinyrwm) by Isaac Freund,
-originally licensed under 0BSD & MIT.
-
 ## Dependencies
 
 The following system dependencies are required:
@@ -33,3 +28,8 @@ sudo make install
 ```
 river -c rwm
 ```
+
+## Acknowledgements
+
+Form of [tinyrwm](https://codeberg.org/river/tinyrwm) by Isaac Freund,
+originally licensed under 0BSD & MIT.
