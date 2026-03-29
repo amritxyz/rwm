@@ -694,6 +694,35 @@ static void wm_handle_manage_start(void *data, struct river_window_manager_v1 *o
 
 static void wm_handle_render_start(void *data, struct river_window_manager_v1 *obj) {
 	struct Window *window;
+
+	/* Window Borders */
+	wl_list_for_each(window, &wm.windows, link) {
+		if (window->closed) continue;
+		river_node_v1_set_position(window->node, window->x, window->y);
+
+		bool focused = false;
+		struct Seat *seat;
+		wl_list_for_each(seat, &wm.seats, link) {
+			if (seat->focused == window) {
+				focused = true;
+				break;
+			}
+		}
+
+		/* width, red, green, blue, alpha */
+		uint32_t w = 3;
+		uint32_t r = focused ? 0x44444400 : 0x1d202100;
+		uint32_t g = focused ? 0x00000000 : 0x1d202100;
+		uint32_t b = focused ? 0x00000000 : 0x1d202100;
+		uint32_t a = 0xFF000000;
+
+		river_window_v1_set_borders(window->obj,
+				RIVER_WINDOW_V1_EDGES_TOP | RIVER_WINDOW_V1_EDGES_BOTTOM |
+				RIVER_WINDOW_V1_EDGES_LEFT | RIVER_WINDOW_V1_EDGES_RIGHT,
+				w, r, g, b, a
+		);
+	}
+
 	wl_list_for_each(window, &wm.windows, link) {
 		if (window->closed) continue;
 		river_node_v1_set_position(window->node, window->x, window->y);
