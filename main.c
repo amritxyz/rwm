@@ -35,6 +35,7 @@ struct Output {
 	int32_t x, y, width, height;
 
 	struct wl_list link; // WindowManager.outputs
+	struct wl_list windows; // Window.output_link
 };
 
 static struct {
@@ -64,6 +65,11 @@ struct Window {
 	uint32_t pointer_resize_requested_edges;
 
 	struct wl_list link; // WindowManager.windows
+
+	struct Output *output;
+	bool tiled; /* Current layout */
+
+	struct wl_list output_link; // Output.windows
 };
 
 enum Action {
@@ -260,11 +266,11 @@ static void window_maybe_destroy(struct Window *window) {
 
 	river_window_v1_destroy(window->obj);
 	wl_list_remove(&window->link);
+	wl_list_remove(&window->output_link);
 	free(window);
 }
 
 static void window_set_position(struct Window *window, int32_t x, int32_t y) {
-	river_node_v1_set_position(window->node, x, y);
 	window->x = x;
 	window->y = y;
 }
@@ -275,8 +281,9 @@ static void seat_pointer_resize(struct Seat *seat, struct Window *window, uint32
 static void window_manage(struct Window *window) {
 	if (window->new) {
 		window->new = false;
-		// window_set_position(window, 0, 0);
-		river_window_v1_propose_dimensions(window->obj, 0, 0);
+		if (!window->tiled) {
+			river_window_v1_propose_dimensions(window->obj, 0, 0);
+		}
 	}
 	if (window->pointer_move_requested != NULL) {
 		seat_pointer_move(window->pointer_move_requested, window);
@@ -505,13 +512,13 @@ static void seat_action(struct Seat *seat, enum Action action) {
 		river_window_manager_v1_exit_session(window_manager_v1);
 		break;
 	case ACTION_LAYOUT_TOGGLE: {
-			if (!wl_list_empty(&wm.outputs)) {
-				struct Output *output = wl_container_of(&wm.outputs, output, link);
+			if (wl_list_empty(&wm.outputs)) break;
+				struct Output *output = wl_container_of(wm.outputs.next, output, link);
 				output->layout_mode = (output->layout_mode == LAYOUT_MASTER_STACK)
 					? LAYOUT_FLOATING : LAYOUT_MASTER_STACK;
+				river_window_manager_v1_manage_dirty(window_manager_v1);
+				break;
 			}
-			break;
-		}
 	case ACTION_MASTER_INC: {
 			if (!wl_list_empty(&wm.outputs)) {
 				struct Output *output = wl_container_of(&wm.outputs, output, link);
@@ -657,12 +664,23 @@ static void wm_handle_manage_start(void *data, struct river_window_manager_v1 *o
 	wl_list_for_each_safe(seat, seat_tmp, &wm.seats, link) {
 		seat_maybe_destroy(seat);
 	}
+	// Give new windows a default size so they participate in first layout pass
+	wl_list_for_each(window, &wm.windows, link) {
+		if (window->new && window->output) {
+			river_window_v1_propose_dimensions(window->obj,
+					window->output->width / 2,
+					window->output->height / 2);
+		}
+	}
 
 	layout_all();
 
 	// Carry out window management policy
 	wl_list_for_each(window, &wm.windows, link) {
 		window_manage(window);
+	}
+	wl_list_for_each(window, &wm.windows, link) {
+		window->new = false;
 	}
 	wl_list_for_each(seat, &wm.seats, link) {
 		seat_manage(seat);
@@ -672,6 +690,12 @@ static void wm_handle_manage_start(void *data, struct river_window_manager_v1 *o
 }
 
 static void wm_handle_render_start(void *data, struct river_window_manager_v1 *obj) {
+	struct Window *window;
+	wl_list_for_each(window, &wm.windows, link) {
+		if (window->closed) continue;
+		river_node_v1_set_position(window->node, window->x, window->y);
+	}
+
 	struct Seat *seat;
 	wl_list_for_each(seat, &wm.seats, link) {
 		seat_render(seat);
@@ -683,7 +707,7 @@ static void wm_handle_render_start(void *data, struct river_window_manager_v1 *o
 			river_output_v1_set_presentation_mode(
 					output->obj,
 					RIVER_OUTPUT_V1_PRESENTATION_MODE_ASYNC);
-		};
+		}
 	}
 
 	river_window_manager_v1_render_finish(window_manager_v1);
@@ -695,10 +719,29 @@ static void wm_handle_window(
 	window->obj = river_window;
 	window->node = river_window_v1_get_node(window->obj);
 	window->new = true;
+	window->tiled = false;
+
+	// Assign to focused seat's output, fallback to first output
+	window->output = NULL;
+	struct Seat *seat;
+	wl_list_for_each(seat, &wm.seats, link) {
+		if (seat->focused) {
+			window->output = seat->focused->output;
+			break;
+		}
+	}
+	if (!window->output) {
+		// fallback: assign to first non-removed output
+		struct Output *o;
+		wl_list_for_each(o, &wm.outputs, link) {
+			if (!o->removed) { window->output = o; break; }
+		}
+	}
 
 	river_window_v1_add_listener(window->obj, &river_window_listener, window);
-
 	wl_list_insert(wm.windows.prev, &window->link);
+	if (window->output)
+		wl_list_insert(window->output->windows.prev, &window->output_link);
 }
 
 static void wm_handle_output(
@@ -719,7 +762,7 @@ static void wm_handle_output(
 	output->width = 1920; output->height = 1200;
 
 	river_output_v1_add_listener(output->obj, &river_output_listener, output);
-
+	wl_list_init(&output->windows);
 	wl_list_insert(wm.outputs.prev, &output->link);
 }
 
@@ -790,23 +833,33 @@ static int collect_windows(struct Window **out, int max) {
 
 /* Master-stack tiling algorithm */
 static void layout_master_stack(struct Output *output) {
+	// Collect non-closed, non-floating tiled windows for this output
 	struct Window *windows[64];
-	int count = collect_windows(windows, 64);
+	int count = 0;
+	struct Window *w;
+	wl_list_for_each(w, &output->windows, output_link) {
+		if (w->closed) continue;
+		if (count >= 64) break;
+		windows[count++] = w;
+	}
 	if (count == 0) return;
 
 	int gap = output->gap_size;
+	int usable_x = output->x + gap;
+	int usable_y = output->y + gap;
+	int usable_w = output->width  - gap * 2;
+	int usable_h = output->height - gap * 2;
 
-	/* If there is one client then occupy full screen */
 	if (count == 1) {
 		struct Window *win = windows[0];
-		int x = output->x + gap;
-		int y = output->y + gap;
-		int w = output->width - gap * 2;
-		int h = output->height - gap * 2;
-
-		river_node_v1_set_position(win->node, x, y);
-		river_window_v1_propose_dimensions(win->obj, w > 50 ? w : 50, h > 50 ? h : 50);
-		win->x = x; win->y = y;
+		int w = usable_w > 50 ? usable_w : 50;
+		int h = usable_h > 50 ? usable_h : 50;
+		river_window_v1_propose_dimensions(win->obj, w, h);
+		// set_tiled: all 4 edges (top=1, bottom=2, left=4, right=8 → 15)
+		river_window_v1_set_tiled(win->obj, 15);
+		win->tiled = true;
+		// node position is rendering state — done in render sequence
+		win->x = usable_x; win->y = usable_y;
 		win->width = w; win->height = h;
 		return;
 	}
@@ -819,47 +872,41 @@ static void layout_master_stack(struct Output *output) {
 	if (ratio < 0.1f) ratio = 0.1f;
 	if (ratio > 0.9f) ratio = 0.9f;
 
-	/* Calculate areas */
-	int usable_w = output->width - gap * 2;
-	int usable_h = output->height - gap * 2;
-	int master_w = (int)(usable_w * ratio) - gap;
-	int stack_w = usable_w - master_w - gap;
-
-	int base_x = output->x + gap;
-	int base_y = output->y + gap;
-
-	/* Layout master windows [left side, vertical stack] */
-	for (int i = 0; i < master_count; i++) {
-		struct Window *win = windows[i];
-		int win_h = (usable_h / master_count) - gap;
-		int x = base_x;
-		int y = base_y + i * (win_h + gap);
-
-		river_node_v1_set_position(win->node, x, y);
-		river_window_v1_propose_dimensions(win->obj,
-				master_w > 50 ? master_w : 50,
-				win_h > 50 ? win_h : 50);
-
-		// Cache for interactive ops
-		win->x = x; win->y = y;
-		win->width = master_w; win->height = win_h;
-	}
-
-	/* Layout stack windows [right side, vertical stack] */
+	int master_w = (int)(usable_w * ratio) - gap / 2;
+	int stack_w  = usable_w - master_w - gap;
 	int stack_count = count - master_count;
-	for (int i = 0; i < stack_count; i++) {
-		struct Window *win = windows[master_count + i];
-		int win_h = (usable_h / stack_count) - gap;
-		int x = base_x + master_w + gap;
-		int y = base_y + i * (win_h + gap);
 
-		river_node_v1_set_position(win->node, x, y);
-		river_window_v1_propose_dimensions(win->obj,
-				stack_w > 50 ? stack_w : 50,
-				win_h > 50 ? win_h : 50);
+	for (int i = 0; i < count; i++) {
+		struct Window *win = windows[i];
+		int x, y, ww, wh;
 
+		if (i < master_count) {
+			wh = (usable_h / master_count) - gap;
+			ww = master_w;
+			x  = usable_x;
+			y  = usable_y + i * (wh + gap);
+		} else {
+			int si = i - master_count;
+			wh = (usable_h / stack_count) - gap;
+			ww = stack_w;
+			x  = usable_x + master_w + gap;
+			y  = usable_y + si * (wh + gap);
+		}
+		if (ww < 50) ww = 50;
+		if (wh < 50) wh = 50;
+
+		// propose_dimensions: window management state (manage sequence) ✓
+		river_window_v1_propose_dimensions(win->obj, ww, wh);
+
+		// set_tiled with appropriate edges
+		uint32_t tiled_edges = 15; // all edges by default
+		if (i == 0 && master_count == 1) tiled_edges = 15;
+		river_window_v1_set_tiled(win->obj, tiled_edges);
+		win->tiled = true;
+
+		// Cache desired position — applied in render_start
 		win->x = x; win->y = y;
-		win->width = stack_w; win->height = win_h;
+		win->width = ww; win->height = wh;
 	}
 }
 
